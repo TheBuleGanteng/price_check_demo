@@ -1,28 +1,27 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import items
+from app.utils.logging_config import setup_logging, get_logger
 from dotenv import load_dotenv
-import logging
 from contextlib import asynccontextmanager
+import os
 
 # Load environment variables
 load_dotenv()
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+# Set up rich logging
+setup_logging(log_level=os.getenv("LOG_LEVEL", "DEBUG"))
+logger = get_logger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("Price Check Demo API is starting up...")
+    logger.info("running lifespan ... Price Check Demo API is starting up...")
+    logger.info("running lifespan ... Setting up middleware and routes...")
     yield
     # Shutdown
-    logger.info("Price Check Demo API is shutting down...")
+    logger.info("running lifespan ... Price Check Demo API is shutting down...")
 
 
 # Create FastAPI app
