@@ -1,127 +1,162 @@
 import os
-from typing import List
-from exa_py import Exa
-from app.models.item import ItemRequest, PriceResult
-from app.utils.logging_config import get_logger, log_exa_search, log_error
+import json
+import re
+from typing import Optional
+from openai import OpenAI
+from app.models.item import ItemRequest
+from app.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 
 class ExaPriceSearchService:
-    """Service for searching item prices using Exa API"""
+    """Service for searching item prices using Exa API via OpenAI client"""
     
     def __init__(self):
         self.api_key = os.getenv("EXA_API_KEY")
         if not self.api_key:
             raise ValueError("EXA_API_KEY environment variable is required")
         
-        self.client = Exa(api_key=self.api_key)
+        self.client = OpenAI(
+            base_url="https://api.exa.ai",
+            api_key=self.api_key,
+        )
     
     def create_search_query(self, item: ItemRequest) -> str:
         """Create an optimized search query for price information"""
-        # Create a search query focused on finding current prices
-        query = f"{item.item_name} price buy purchase cost"
-        logger.info(f"🔧 Created search query: [bold yellow]'{query}'[/bold yellow]")
+        # Create a search query that includes quantity for better results
+        query = f"What is the average retail price for {item.item_quantity} new {item.item_name} in the Tennessee area?"        
+        logger.debug(f"running create_search_query ... Created search query: '{query}'")
         return query
     
-    def search_item_prices(self, item: ItemRequest, num_results: int = 5) -> List[PriceResult]:
+    def search_item_price(self, item: ItemRequest) -> Optional[float]:
         """
-        Search for item prices using Exa API
+        Search for item price using Exa API and return a single price
         
         Args:
             item: ItemRequest object with item details
-            num_results: Number of search results to return
             
         Returns:
-            List of PriceResult objects
+            Float price if found, None if not found
         """
         try:
             search_query = self.create_search_query(item)
             
-            # Perform the search with Exa
-            logger.info(f"🌐 Calling Exa API for: [bold green]'{search_query}'[/bold green]")
+            # Perform the search with Exa using OpenAI client
+            logger.debug(f"running search_item_price ... Calling Exa API for: '{search_query}'")
             
-            response = self.client.search_and_contents(
-                query=search_query,
-                num_results=num_results,
-                text=True,
-                highlights=True,
-                type="auto"  # Let Exa decide the best search type
+            completion = self.client.chat.completions.create(
+                model="exa",
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": "Output should be price in US Dollars, as a float. Do not include any symbols, such as $. If multiple prices are found, return the most reasonable retail price. If no price is found, return null."
+                    },
+                    {
+                        "role": "user", 
+                        "content": search_query
+                    }
+                ],
+                extra_body={
+                    "text": True,
+                    "output_schema": {
+                        "type": "object",
+                        "required": ["price"],
+                        "additionalProperties": False,
+                        "properties": {
+                            "price": {
+                                "type": ["number", "null"],
+                                "description": "The retail price in US Dollars as a float, or null if no price found"
+                            }
+                        }
+                    }
+                }
             )
             
-            logger.info(f"📡 Exa API returned {len(response.results)} results")
+            logger.debug(f"running search_item_price ... Exa API call completed")
             
-            price_results: List[PriceResult] = []
+            # Extract the response
+            response_content = completion.choices[0].message.content
+            logger.debug(f"running search_item_price ... Raw response: {response_content}")
             
-            for i, result in enumerate(response.results, 1):
-                logger.info(f"🔍 Processing result {i}: [blue]{result.title}[/blue]")
-                
-                # Extract price-related information from the content
-                price_info = self._extract_price_info(result.text or "")
-                
-                price_result = PriceResult(
-                    source_title=result.title or "No title",
-                    source_url=result.url,
-                    price_info=price_info,
-                    snippet=result.highlights[0] if result.highlights else result.text[:200] + "..." if result.text else "No content available"
-                )
-                price_results.append(price_result)
-                
-                logger.info(f"💰 Extracted price info: [cyan]{price_info}[/cyan]")
+            # Parse the response to extract price
+            price = self._parse_price_response(response_content)
             
-            log_exa_search(search_query, len(price_results))
-            return price_results
+            if price is not None:
+                logger.debug(f"running search_item_price ... result #1 price: ${price:.2f}")
+                logger.debug(f"running search_item_price ... Exa search: '{search_query}' -> 1 result")
+                logger.debug(f"running search_item_price ... Final price selected: ${price:.2f}")
+            else:
+                logger.debug(f"running search_item_price ... result #1 price: No price found")
+                logger.debug(f"running search_item_price ... Exa search: '{search_query}' -> 0 results")
+                logger.warning(f"running search_item_price ... No price found in search results")
+                
+            return price
             
         except Exception as e:
-            log_error(f"Error searching for item prices: {str(e)}")
+            logger.error(f"running search_item_price ... Error searching for item price: {str(e)}")
             raise
     
-    def _extract_price_info(self, text: str) -> str:
+    def _parse_price_response(self, response_content: Optional[str]) -> Optional[float]:
         """
-        Extract price-related information from text content
+        Parse the Exa API response to extract price
         
         Args:
-            text: Text content to search for prices
+            response_content: Raw response content from Exa API
             
         Returns:
-            String containing price information or indication if none found
+            Float price if found, None if not found
         """
-        import re
+        if not response_content:
+            return None
         
-        if not text:
-            return "No price information available"
-        
-        # Look for various price patterns
-        price_patterns = [
-            r'\$\d+(?:\.\d{2})?',  # $19.99, $100
-            r'\d+\.\d{2}\s*(?:USD|dollars?)',  # 19.99 USD, 100 dollars
-            r'(?:price|cost|costs?):?\s*\$?\d+(?:\.\d{2})?',  # price: $19.99, cost 100
-            r'\d+\s*(?:dollars?|USD|\$)',  # 100 dollars, 50 USD
-        ]
-        
-        found_prices: List[str] = []
-        for pattern in price_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            found_prices.extend(matches)
-        
-        if found_prices:
-            # Return first few unique prices found
-            unique_prices = list(set(found_prices))[:3]
-            return f"Found prices: {', '.join(unique_prices)}"
-        
-        # If no explicit prices found, look for price-related context
-        price_keywords = ['price', 'cost', 'buy', 'purchase', 'sale', 'discount', 'deal']
-        text_lower = text.lower()
-        
-        for keyword in price_keywords:
-            if keyword in text_lower:
-                # Extract sentence containing the keyword
-                sentences = text.split('.')
-                for sentence in sentences:
-                    if keyword in sentence.lower():
-                        return f"Price context: {sentence.strip()[:150]}..."
-        
-        return "No specific price information found"
+        try:
+            # Try to parse as JSON first
+            try:
+                parsed_data = json.loads(response_content)
+                if isinstance(parsed_data, dict) and "price" in parsed_data:
+                    # Extract price with proper type handling
+                    price_field = parsed_data["price"] # type: ignore
+                    
+                    # Type narrow using isinstance checks
+                    if isinstance(price_field, (int, float)):
+                        price = float(price_field)
+                        if 0 < price < 1000000:  # Reasonable price range
+                            return round(price, 2)
+                        return None
+                    elif price_field is None:
+                        return None
+                    else:
+                        # Unexpected type, fall through to regex parsing
+                        pass
+                        
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+                pass
+
+            
+            # Fallback: try to extract number directly from response
+            # Look for floating point numbers in the response
+            number_patterns = [
+                r'(\d+\.\d{2})',  # 19.99
+                r'(\d+\.\d{1})',  # 19.9
+                r'(\d+)',         # 19
+            ]
+            
+            for pattern in number_patterns:
+                matches = re.findall(pattern, response_content)
+                if matches:
+                    try:
+                        price = float(matches[0])
+                        if 0 < price < 1000000:  # Reasonable price range
+                            return round(price, 2)
+                    except (ValueError, TypeError):
+                        continue
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"running _parse_price_response ... Error parsing response: {str(e)}")
+            return None
 
 
 # Create a singleton instance
